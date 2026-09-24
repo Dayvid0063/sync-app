@@ -28,7 +28,7 @@ const error = ref<string | null>(null)
 const persisted = ref<boolean | null>(null)
 const storage = shallowRef<{ usage: number, quota: number } | null>(null)
 
-const markerValue = `${MODEL.id}@${MODEL.revision}`
+const markerValue = MODEL.url
 function setMarker(on: boolean) {
   try {
     if (on) localStorage.setItem(SETUP_MARKER, markerValue)
