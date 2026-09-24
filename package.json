@@ -1,5 +1,5 @@
 {
-  "name": "sync-app",
+  "name": "afronet",
   "type": "module",
   "private": true,
   "scripts": {
@@ -7,11 +7,19 @@
     "dev": "nuxt dev",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
-    "postinstall": "nuxt prepare"
+    "postinstall": "nuxt prepare",
+    "icons": "pwa-assets-generator",
+    "preview:pwa": "nuxt generate && serve .output/public -l 3000"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.0",
     "nuxt": "^4.5.2",
     "vue": "^3.5.43",
     "vue-router": "^5.3.1"
+  },
+  "devDependencies": {
+    "@vite-pwa/assets-generator": "^1.0.4",
+    "@vite-pwa/nuxt": "^1.1.1",
+    "serve": "^14.2.6"
   }
 }
