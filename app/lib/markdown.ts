@@ -16,7 +16,8 @@ export function renderMarkdown(src: string): string {
   const lines = src.replace(/\r\n/g, '\n').split('\n')
   const out: string[] = []
   let para: string[] = []
-  let list: { tag: 'ul' | 'ol', items: string[] } | null = null
+  // Typed via assertion: TS would otherwise narrow it to null, missing updates made in flushList.
+  let list = null as { tag: 'ul' | 'ol', items: string[] } | null
 
   const flushPara = () => {
     if (para.length) out.push(`<p>${para.map(inline).join('<br>')}</p>`)

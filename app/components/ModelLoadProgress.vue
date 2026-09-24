@@ -1,11 +1,22 @@
 <script setup lang="ts">
-// First-run setup card: explains the one-time download, shows progress, handles errors.
+// Setup card: one-time download, startup, interrupted/unsupported/error states.
 import { formatBytes } from '~/lib/storage'
 
-const { status, info, progress, fromCache, error, load } = useLLM()
+const { status, info, progress, fromCache, initStartedAt, interrupted, error, load } = useLLM()
 const online = useOnline()
 
 const percent = computed(() => Math.floor(progress.value?.percent ?? 0))
+const starting = computed(() => status.value === 'loading' && (progress.value?.phase === 'init' || fromCache.value))
+
+// Elapsed seconds while starting, so a slow phone looks busy rather than frozen.
+const now = ref(Date.now())
+let timer: ReturnType<typeof setInterval> | undefined
+watch(starting, (on) => {
+  clearInterval(timer)
+  if (on) timer = setInterval(() => { now.value = Date.now() }, 1000)
+}, { immediate: true })
+onBeforeUnmount(() => clearInterval(timer))
+const elapsed = computed(() => initStartedAt.value ? Math.max(0, Math.round((now.value - initStartedAt.value) / 1000)) : 0)
 </script>
 
 <template>
@@ -14,25 +25,55 @@ const percent = computed(() => Math.floor(progress.value?.percent ?? 0))
       <p class="muted">Checking your device…</p>
     </template>
 
-    <template v-else-if="status === 'needs-download'">
-      <h2>Set up Afronet</h2>
+    <template v-else-if="status === 'unsupported'">
+      <h2>Not supported on this device yet</h2>
       <p>
-        Afronet runs its AI directly on your phone, so it works without internet.
-        It needs a one-time download of about
-        <strong>{{ formatBytes(info?.downloadBytes ?? 0) }}</strong>.
+        Afronet needs <strong>WebGPU</strong> to run its AI on your device, and this browser or
+        device doesn't provide it.
       </p>
+      <p class="muted">
+        Try an up-to-date Chrome, Edge or Samsung Internet on Android, or Safari on iOS 26 or later.
+        Support for more devices is coming.
+      </p>
+    </template>
+
+    <template v-else-if="status === 'needs-download'">
+      <template v-if="interrupted">
+        <h2>Finish setting up</h2>
+        <p>Setup didn't finish last time. Anything already downloaded is kept, so this continues where it stopped.</p>
+      </template>
+      <template v-else>
+        <h2>Set up Afronet</h2>
+        <p>
+          Afronet runs its AI directly on your device, so it works without internet.
+          It needs a one-time download of about
+          <strong>{{ formatBytes(info?.downloadBytes ?? 0) }}</strong>.
+        </p>
+      </template>
       <p class="muted">Use Wi-Fi if you can. After this, no data is needed to chat.</p>
       <button type="button" class="primary" :disabled="!online" @click="load()">
-        Download ({{ formatBytes(info?.downloadBytes ?? 0) }})
+        {{ interrupted ? 'Continue' : 'Download' }} ({{ formatBytes(info?.downloadBytes ?? 0) }})
       </button>
       <p v-if="!online" class="warn">You're offline. Connect to the internet to download.</p>
     </template>
 
-    <template v-else-if="status === 'loading' || status === 'cached'">
-      <template v-if="progress?.phase === 'init' || status === 'cached' || fromCache">
+    <template v-else-if="status === 'cached'">
+      <!-- Only shown when auto-start is held back after an interrupted setup. -->
+      <h2>Afronet stopped while starting</h2>
+      <p>
+        Last time, your device closed Afronet before the AI finished starting. This usually means
+        it was low on memory.
+      </p>
+      <p class="muted">Close other apps and browser tabs, then try again. Nothing needs to be downloaded.</p>
+      <button type="button" class="primary" @click="load()">Start Afronet</button>
+    </template>
+
+    <template v-else-if="status === 'loading'">
+      <template v-if="starting">
         <h2>Starting Afronet…</h2>
         <p class="muted">Preparing the AI on your device. This can take a little while on phones.</p>
         <div class="bar indeterminate"><span /></div>
+        <p v-if="elapsed >= 5" class="muted small">{{ elapsed }}s</p>
       </template>
       <template v-else>
         <h2>Downloading…</h2>
@@ -52,7 +93,7 @@ const percent = computed(() => Math.floor(progress.value?.percent ?? 0))
     <template v-else-if="status === 'error'">
       <h2>Something went wrong</h2>
       <p class="warn">{{ error }}</p>
-      <p v-if="!online" class="muted">You're offline. If the download didn't finish, reconnect and try again.</p>
+      <p v-if="!online" class="muted">You're offline. If the download didn't finish, reconnect and try again — finished files are kept.</p>
       <button type="button" class="primary" @click="load()">Try again</button>
     </template>
   </section>

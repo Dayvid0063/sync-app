@@ -2,11 +2,16 @@ import type { ChatMessage, Device, GenerateStats, LoadProgress } from './types'
 
 /** Messages between TransformersEngine (main thread) and transformers.worker.ts. */
 
+/** Cache Storage bucket transformers.js reads model files from (its default `env.cacheKey`). */
+export const CACHE_NAME = 'transformers-cache'
+
 export interface WorkerLoadConfig {
-  modelId: string
+  id: string
   revision: string
   device: Device
   dtype: string
+  /** Repo-relative files to prefetch into the cache. */
+  files: string[]
   downloadBytes: number
   externalData?: boolean
 }

@@ -14,7 +14,8 @@ import {
 import ortMjsUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs?url'
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url'
 import type { ChatMessage } from './types'
-import type { FromWorker, ToWorker, WorkerLoadConfig } from './protocol'
+import { CACHE_NAME, type FromWorker, type ToWorker, type WorkerLoadConfig } from './protocol'
+import { fileUrl } from './models'
 
 /** Prompt budget. Older turns are dropped beyond this to bound memory and latency. */
 const MAX_PROMPT_TOKENS = 1536
@@ -39,36 +40,90 @@ function configureRuntime(config: WorkerLoadConfig) {
   }
 }
 
-async function load(config: WorkerLoadConfig) {
-  configureRuntime(config)
+/** Files above this are streamed into the cache instead of being buffered in memory. */
+const STREAM_THRESHOLD = 32 * 1024 * 1024
 
-  // Aggregate byte progress across all files against the known download size,
-  // so the bar doesn't jump as each new file starts.
-  const files: Record<string, number> = {}
-  let initAnnounced = false
-  const progress_callback = (info: any) => {
-    if (info.status === 'progress') {
-      files[info.file] = info.loaded
-      const loaded = Object.values(files).reduce((a, b) => a + b, 0)
-      post({
-        type: 'progress',
-        progress: {
-          phase: 'download',
-          loaded,
-          total: config.downloadBytes,
-          percent: Math.min(99, (loaded / config.downloadBytes) * 100)
+/**
+ * Downloads every model file into transformers.js's cache before it loads anything.
+ * - Large files stream straight to Cache Storage, so the download never holds the whole
+ *   model in memory (the in-memory approach crashed phones).
+ * - Each cache entry is written in one `put`, which only succeeds for a complete body, and
+ *   carries an exact Content-Length (transformers.js sizes its read buffer from it).
+ * - Files already cached are skipped, so an interrupted setup never re-downloads them.
+ */
+async function prefetch(config: WorkerLoadConfig) {
+  const cache = await caches.open(CACHE_NAME)
+  let loaded = 0
+  const report = () => post({
+    type: 'progress',
+    progress: {
+      phase: 'download',
+      loaded,
+      total: config.downloadBytes,
+      percent: Math.min(99, (loaded / config.downloadBytes) * 100)
+    }
+  })
+
+  for (const file of config.files) {
+    const url = fileUrl(config, file)
+    const cached = await cache.match(url)
+    if (cached) {
+      loaded += Number(cached.headers.get('content-length') ?? 0)
+      report()
+      continue
+    }
+
+    const res = await fetch(url)
+    if (!res.ok || !res.body) throw new Error(`Download failed for ${file} (HTTP ${res.status})`)
+    const expected = Number(res.headers.get('content-length') ?? 0)
+    const headers = new Headers({ 'content-type': res.headers.get('content-type') ?? 'application/octet-stream' })
+
+    if (expected > STREAM_THRESHOLD) {
+      let received = 0
+      const counter = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, ctl) {
+          received += chunk.byteLength
+          loaded += chunk.byteLength
+          report()
+          ctl.enqueue(chunk)
         }
       })
+      headers.set('content-length', String(expected))
+      await cache.put(url, new Response(res.body.pipeThrough(counter), { headers }))
+      if (received !== expected) {
+        await cache.delete(url)
+        throw new Error(`Download of ${file} was incomplete (${received} of ${expected} bytes)`)
+      }
     }
-    else if (info.status === 'done' && /\.onnx(_data)?$/.test(String(info.file)) && !initAnnounced) {
-      initAnnounced = true
-      post({ type: 'progress', progress: { phase: 'init', loaded: config.downloadBytes, total: config.downloadBytes, percent: 100 } })
+    else {
+      // Small files (configs, tokenizer): buffer, so the stored length is exact even when the
+      // server compressed the transfer.
+      const chunks: Uint8Array[] = []
+      const reader = res.body.getReader()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        chunks.push(value)
+        loaded += value.byteLength
+        report()
+      }
+      const body = new Blob(chunks as BlobPart[])
+      headers.set('content-length', String(body.size))
+      await cache.put(url, new Response(body, { headers }))
     }
   }
+}
 
-  const opts = { revision: config.revision, progress_callback }
-  tokenizer = await AutoTokenizer.from_pretrained(config.modelId, opts)
-  model = await AutoModelForCausalLM.from_pretrained(config.modelId, {
+async function load(config: WorkerLoadConfig) {
+  configureRuntime(config)
+  await prefetch(config)
+
+  // From here transformers.js reads only from the cache.
+  post({ type: 'progress', progress: { phase: 'init', loaded: config.downloadBytes, total: config.downloadBytes, percent: 100 } })
+
+  const opts = { revision: config.revision }
+  tokenizer = await AutoTokenizer.from_pretrained(config.id, opts)
+  model = await AutoModelForCausalLM.from_pretrained(config.id, {
     ...opts,
     dtype: config.dtype as any,
     device: config.device,
@@ -81,10 +136,6 @@ async function load(config: WorkerLoadConfig) {
   model.forward = async (inputs: any) => {
     await yieldToEventLoop()
     return forward(inputs)
-  }
-
-  if (!initAnnounced) {
-    post({ type: 'progress', progress: { phase: 'init', loaded: config.downloadBytes, total: config.downloadBytes, percent: 100 } })
   }
 
   // WebGPU compiles shaders on first run; do it now rather than on the user's first question.

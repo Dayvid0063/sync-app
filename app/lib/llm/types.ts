@@ -57,4 +57,6 @@ export interface LLMEngine {
   isCached(): Promise<boolean>
   /** Stats for the most recent completed generation. */
   readonly lastStats: GenerateStats | null
+  /** Frees storage held by files this engine no longer uses (older models or versions). */
+  pruneCache?(): Promise<void>
 }

@@ -5,7 +5,8 @@ const draft = ref('')
 const input = ref<{ focus: () => void } | null>(null)
 
 // Model already on the device → start it straight away; a download always waits for a tap.
-watch(llm.status, (s) => { if (s === 'cached') llm.load() }, { immediate: true })
+// After an interrupted setup (likely a memory crash) wait for a tap too, to avoid a crash loop.
+watch(llm.status, (s) => { if (s === 'cached' && !llm.interrupted.value) llm.load() }, { immediate: true })
 
 const ready = computed(() => llm.status.value === 'ready')
 

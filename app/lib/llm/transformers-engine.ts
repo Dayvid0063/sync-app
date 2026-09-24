@@ -1,10 +1,18 @@
 import type { ChatMessage, EngineInfo, GenerateOptions, GenerateStats, LLMEngine, LoadProgress } from './types'
-import type { FromWorker, ToWorker } from './protocol'
-import { fileUrl, variantKey, type ModelSpec } from './models'
+import { CACHE_NAME, type FromWorker, type ToWorker } from './protocol'
+import { fileUrl, variantKey, type ModelSpec, type ModelVariant } from './models'
 import type { DeviceCaps } from './device'
 
-const CACHE_NAME = 'transformers-cache'
 const DEFAULT_MAX_NEW_TOKENS = 512
+/**
+ * Upper bound for turning cached files into a running model. Phones that run out of memory
+ * here can stall instead of failing (seen on a 4 GB Samsung), so give up and say so.
+ */
+const INIT_TIMEOUT_MS = 3 * 60_000
+
+export function variantFor(spec: ModelSpec, caps: DeviceCaps): ModelVariant | undefined {
+  return spec.variants[variantKey(caps.device, caps.shaderF16)]
+}
 
 /** LLMEngine backed by transformers.js running in a dedicated Web Worker. */
 export class TransformersEngine implements LLMEngine {
@@ -16,21 +24,37 @@ export class TransformersEngine implements LLMEngine {
   private nextId = 1
   private busy = false
 
+  /** Only construct for devices the model has a variant for (see `variantFor`). */
   constructor(private spec: ModelSpec, private caps: DeviceCaps) {
     this.info = this.infoFor(caps)
   }
 
+  private variant(caps = this.caps) {
+    const variant = variantFor(this.spec, caps)
+    if (!variant) throw new Error(`${this.spec.label} can't run on ${caps.device} on this device`)
+    return variant
+  }
+
   private infoFor(caps: DeviceCaps): EngineInfo {
-    const variant = this.spec.variants[variantKey(caps.device, caps.shaderF16)]
+    const variant = this.variant(caps)
     return { modelId: this.spec.id, device: caps.device, dtype: variant.dtype, downloadBytes: variant.downloadBytes }
   }
 
   async isCached() {
     if (!('caches' in self)) return false
     const cache = await caches.open(CACHE_NAME)
-    const variant = this.spec.variants[variantKey(this.caps.device, this.caps.shaderF16)]
-    const hits = await Promise.all(variant.files.map(f => cache.match(fileUrl(this.spec, f))))
+    const hits = await Promise.all(this.variant().files.map(f => cache.match(fileUrl(this.spec, f))))
     return hits.every(Boolean)
+  }
+
+  /** Deletes cached files from other models/revisions/variants (e.g. the old Gemma 1B, ~0.8–1 GB). */
+  async pruneCache() {
+    if (!('caches' in self)) return
+    const cache = await caches.open(CACHE_NAME)
+    const keep = new Set(this.variant().files.map(f => fileUrl(this.spec, f)))
+    for (const req of await cache.keys()) {
+      if (!keep.has(req.url)) await cache.delete(req)
+    }
   }
 
   load(onProgress?: (p: LoadProgress) => void) {
@@ -46,12 +70,13 @@ export class TransformersEngine implements LLMEngine {
       await this.loadOn(this.caps, onProgress)
     }
     catch (err) {
-      if (this.caps.device !== 'webgpu') throw err
+      const cpu: DeviceCaps = { device: 'wasm', shaderF16: false, reason: `WebGPU failed: ${(err as Error).message}` }
+      if (this.caps.device !== 'webgpu' || !variantFor(this.spec, cpu)) throw err
       // WebGPU exists but failed (driver bugs, OOM on low-end GPUs). Retry on CPU.
       console.warn('[afronet] WebGPU load failed, falling back to WASM:', err)
-      this.caps = { device: 'wasm', shaderF16: false, reason: `WebGPU failed: ${(err as Error).message}` }
-      this.info = this.infoFor(this.caps)
-      await this.loadOn(this.caps, onProgress)
+      this.caps = cpu
+      this.info = this.infoFor(cpu)
+      await this.loadOn(cpu, onProgress)
     }
   }
 
@@ -59,31 +84,47 @@ export class TransformersEngine implements LLMEngine {
     this.worker?.terminate()
     const worker = new Worker(new URL('./transformers.worker.ts', import.meta.url), { type: 'module' })
     this.worker = worker
-    const info = this.infoFor(caps)
+    const variant = this.variant(caps)
 
     return new Promise<void>((resolve, reject) => {
+      let initTimer: ReturnType<typeof setTimeout> | undefined
+      const fail = (message: string) => {
+        cleanup()
+        worker.terminate()
+        if (this.worker === worker) this.worker = null
+        reject(new Error(message))
+      }
       const onMessage = (e: MessageEvent<FromWorker>) => {
         const msg = e.data
-        if (msg.type === 'progress') onProgress?.(msg.progress)
+        if (msg.type === 'progress') {
+          if (msg.progress.phase === 'init' && !initTimer) {
+            initTimer = setTimeout(
+              () => fail('Starting the AI took too long. Your device may not have enough free memory — close other apps and try again.'),
+              INIT_TIMEOUT_MS
+            )
+          }
+          onProgress?.(msg.progress)
+        }
         else if (msg.type === 'ready') { cleanup(); resolve() }
-        else if (msg.type === 'load-error') { cleanup(); worker.terminate(); reject(new Error(msg.message)) }
+        else if (msg.type === 'load-error') fail(msg.message)
       }
-      const onError = (e: ErrorEvent) => { cleanup(); worker.terminate(); reject(new Error(e.message || 'Worker failed to start')) }
+      const onError = (e: ErrorEvent) => fail(e.message || 'The AI worker failed to start')
       const cleanup = () => {
+        clearTimeout(initTimer)
         worker.removeEventListener('message', onMessage)
         worker.removeEventListener('error', onError)
       }
       worker.addEventListener('message', onMessage)
       worker.addEventListener('error', onError)
 
-      const variant = this.spec.variants[variantKey(caps.device, caps.shaderF16)]
       this.post({
         type: 'load',
         config: {
-          modelId: this.spec.id,
+          id: this.spec.id,
           revision: this.spec.revision,
-          device: info.device,
+          device: caps.device,
           dtype: variant.dtype,
+          files: variant.files,
           downloadBytes: variant.downloadBytes,
           externalData: variant.externalData
         }
