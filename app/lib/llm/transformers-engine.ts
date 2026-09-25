@@ -2,6 +2,7 @@ import type { ChatMessage, EngineInfo, GenerateOptions, GenerateStats, LLMEngine
 import { CACHE_NAME, type FromWorker, type ToWorker } from './protocol'
 import { fileUrl, variantKey, type ModelSpec, type ModelVariant } from './models'
 import type { DeviceCaps } from './device'
+import { logEvent } from '~/lib/crashlog'
 
 /** Phones get shorter replies and history: less memory per reply, within tight browser limits. */
 const LIMITS = {
@@ -85,7 +86,7 @@ export class TransformersEngine implements LLMEngine {
       await this.loadOn(this.caps, onProgress)
     }
     catch (err) {
-      const cpu: DeviceCaps = { device: 'wasm', shaderF16: false, phone: this.caps.phone, reason: `WebGPU failed: ${(err as Error).message}` }
+      const cpu: DeviceCaps = { ...this.caps, device: 'wasm', shaderF16: false, reason: `WebGPU failed: ${(err as Error).message}` }
       if (this.caps.device !== 'webgpu' || !variantFor(this.spec, cpu)) throw err
       // WebGPU exists but failed (driver bugs, OOM on low-end GPUs). Retry on CPU.
       console.warn('[afronet] WebGPU load failed, falling back to WASM:', err)
@@ -190,7 +191,28 @@ export class TransformersEngine implements LLMEngine {
       worker.removeEventListener('message', onMessage)
       opts.signal?.removeEventListener('abort', onAbort)
       this.busy = false
+      if (this.caps.webkit) this.recycleWorker()
     }
+  }
+
+  /**
+   * WebKit workaround (onnxruntime#26827): seconds after ONNX Runtime has run, Safari's WASM
+   * optimiser recompiles its hot code in the background and can loop, eating memory until iOS
+   * kills the page (our crash log: killed 5–10 s after a finished reply, while idle). Discarding
+   * the worker right after each reply should throw that background work away with it. The model
+   * is then reloaded from device storage in the background (~3 s on an iPhone 14 Pro), so it's
+   * usually ready again before the next question; generate() waits for it if not.
+   */
+  private recycleWorker() {
+    this.worker?.terminate()
+    this.worker = null
+    this.loading = null
+    const started = performance.now()
+    logEvent('worker discarded after reply; reloading model in background')
+    this.load().then(
+      () => logEvent(`model reloaded in ${((performance.now() - started) / 1000).toFixed(1)}s`),
+      err => logEvent(`background reload failed (will retry on next question): ${(err as Error).message}`)
+    )
   }
 
   private post(msg: ToWorker) {

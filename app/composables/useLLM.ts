@@ -54,7 +54,7 @@ function init() {
     caps.value = created.caps
     engine = created.engine
     const c = created.caps
-    logEvent(`device: ${c.device} (${c.reason})${c.phone ? ', phone' : ''}; model ${MODEL.label} ${engine?.info.dtype ?? ''}`)
+    logEvent(`device: ${c.device} (${c.reason})${c.phone ? ', phone' : ''}${c.webkit ? ', webkit (recycle worker after reply)' : ''}; model ${MODEL.label} ${engine?.info.dtype ?? ''}`)
     if (!engine) {
       status.value = 'unsupported'
       logEvent('unsupported device')
