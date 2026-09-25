@@ -150,6 +150,12 @@ export class TransformersEngine implements LLMEngine {
   }
 
   async *generate(messages: ChatMessage[], opts: GenerateOptions = {}): AsyncIterable<string> {
+    if (!this.worker && !this.loading) {
+      const started = performance.now()
+      logEvent('reloading model for this question')
+      await this.load()
+      logEvent(`model reloaded in ${((performance.now() - started) / 1000).toFixed(1)}s`)
+    }
     await this.load()
     if (this.busy) throw new Error('A reply is already being generated')
     this.busy = true
@@ -199,20 +205,18 @@ export class TransformersEngine implements LLMEngine {
    * WebKit workaround (onnxruntime#26827): seconds after ONNX Runtime has run, Safari's WASM
    * optimiser recompiles its hot code in the background and can loop, eating memory until iOS
    * kills the page (our crash log: killed 5–10 s after a finished reply, while idle). Discarding
-   * the worker right after each reply should throw that background work away with it. The model
-   * is then reloaded from device storage in the background (~3 s on an iPhone 14 Pro), so it's
-   * usually ready again before the next question; generate() waits for it if not.
+   * the worker right after each reply should throw that background work away with it.
+   *
+   * The model is NOT reloaded straight away: reloading in the background killed the page 2–5 s
+   * after a reply (the old worker's memory isn't freed instantly, so two copies overlapped).
+   * Instead generate() reloads it from device storage when the next question is sent
+   * (~3 s on an iPhone 14 Pro).
    */
   private recycleWorker() {
     this.worker?.terminate()
     this.worker = null
     this.loading = null
-    const started = performance.now()
-    logEvent('worker discarded after reply; reloading model in background')
-    this.load().then(
-      () => logEvent(`model reloaded in ${((performance.now() - started) / 1000).toFixed(1)}s`),
-      err => logEvent(`background reload failed (will retry on next question): ${(err as Error).message}`)
-    )
+    logEvent('worker discarded after reply; model reloads on next question')
   }
 
   private post(msg: ToWorker) {
