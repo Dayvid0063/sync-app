@@ -1,5 +1,6 @@
 import { MODEL, createEngine, type DeviceCaps, type EngineInfo, type LLMEngine, type LoadProgress } from '~/lib/llm'
-import { requestPersistentStorage, storageEstimate } from '~/lib/storage'
+import { formatBytes, requestPersistentStorage, storageEstimate } from '~/lib/storage'
+import { logEvent } from '~/lib/crashlog'
 
 export type LLMStatus = 'detecting' | 'unsupported' | 'needs-download' | 'cached' | 'loading' | 'ready' | 'error'
 
@@ -28,7 +29,7 @@ const error = ref<string | null>(null)
 const persisted = ref<boolean | null>(null)
 const storage = shallowRef<{ usage: number, quota: number } | null>(null)
 
-const markerValue = MODEL.url
+const markerValue = `${MODEL.id}@${MODEL.revision}`
 function setMarker(on: boolean) {
   try {
     if (on) localStorage.setItem(SETUP_MARKER, markerValue)
@@ -43,6 +44,7 @@ function readMarker() {
 
 async function refreshStorage() {
   storage.value = await storageEstimate()
+  if (storage.value) logEvent(`storage used ${formatBytes(storage.value.usage)} of ${formatBytes(storage.value.quota)}`)
 }
 
 function init() {
@@ -51,17 +53,22 @@ function init() {
     const created = await createEngine()
     caps.value = created.caps
     engine = created.engine
+    const c = created.caps
+    logEvent(`device: ${c.device} (${c.reason})${c.phone ? ', phone' : ''}; model ${MODEL.label} ${engine?.info.dtype ?? ''}`)
     if (!engine) {
       status.value = 'unsupported'
+      logEvent('unsupported device')
       return
     }
     info.value = engine.info
     await engine.pruneCache?.().catch(err => console.warn('[afronet] cache cleanup failed:', err))
     status.value = (await engine.isCached()) ? 'cached' : 'needs-download'
+    logEvent(`status: ${status.value}${interrupted.value ? ' (previous setup was interrupted)' : ''}`)
     await refreshStorage()
   })().catch((err) => {
     status.value = 'error'
     error.value = err instanceof Error ? err.message : String(err)
+    logEvent(`init error: ${error.value}`)
   })
   return initPromise
 }
@@ -75,19 +82,32 @@ async function load() {
   progress.value = null
   initStartedAt.value = null
   setMarker(true)
+  const started = Date.now()
+  logEvent(fromCache.value ? 'load: starting from device storage' : 'load: download started')
+  let nextLoggedPct = 25
   try {
     persisted.value = await requestPersistentStorage()
+    logEvent(`persistent storage: ${persisted.value ? 'granted' : 'not granted'}`)
     await engine.load((p) => {
       progress.value = p
-      if (p.phase === 'init' && !initStartedAt.value) initStartedAt.value = Date.now()
+      if (p.phase === 'download' && p.percent >= nextLoggedPct) {
+        logEvent(`download ${Math.floor(p.percent)}% (${formatBytes(p.loaded)})`)
+        nextLoggedPct = (Math.floor(p.percent / 25) + 1) * 25
+      }
+      if (p.phase === 'init' && !initStartedAt.value) {
+        initStartedAt.value = Date.now()
+        logEvent('load: files ready, starting model')
+      }
     })
     info.value = engine.info // may have changed if WebGPU fell back to WASM
     status.value = 'ready'
     interrupted.value = false
+    logEvent(`load: ready in ${((Date.now() - started) / 1000).toFixed(1)}s on ${engine.info.device}`)
   }
   catch (err) {
     status.value = 'error'
     error.value = err instanceof Error ? err.message : String(err)
+    logEvent(`load error: ${error.value}`)
   }
   finally {
     setMarker(false)

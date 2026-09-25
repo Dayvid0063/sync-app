@@ -30,6 +30,8 @@ function useSuggestion(text: string) {
       </button>
     </Teleport>
 
+    <CrashNotice />
+
     <template v-if="ready">
       <ChatMessageList :messages="chat.messages.value" @suggest="useSuggestion" @retry="chat.retry()" />
       <div class="dock">

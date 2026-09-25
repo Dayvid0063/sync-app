@@ -17,8 +17,8 @@ import type { ChatMessage } from './types'
 import { CACHE_NAME, type FromWorker, type ToWorker, type WorkerLoadConfig } from './protocol'
 import { fileUrl } from './models'
 
-/** Prompt budget. Older turns are dropped beyond this to bound memory and latency. */
-const MAX_PROMPT_TOKENS = 1536
+/** Prompt budget (set per device at load). Older turns are dropped beyond this to bound memory and latency. */
+let maxPromptTokens = 1536
 
 const post = (msg: FromWorker) => self.postMessage(msg)
 
@@ -116,6 +116,7 @@ async function prefetch(config: WorkerLoadConfig) {
 
 async function load(config: WorkerLoadConfig) {
   configureRuntime(config)
+  maxPromptTokens = config.promptBudget
   await prefetch(config)
 
   // From here transformers.js reads only from the cache.
@@ -127,7 +128,16 @@ async function load(config: WorkerLoadConfig) {
     ...opts,
     dtype: config.dtype as any,
     device: config.device,
-    ...(config.externalData !== undefined && { use_external_data_format: config.externalData })
+    ...(config.externalData !== undefined && { use_external_data_format: config.externalData }),
+    ...(config.device === 'webgpu' && {
+      session_options: {
+        // Default GPU buffer caching keeps freed buffers pooled for reuse; during text generation
+        // that pool keeps growing (onnxruntime#32017), and on phones GPU memory counts against the
+        // browser tab's memory limit. lazyRelease frees them after the next run instead.
+        // ('disabled' is avoided: it can break GPU-resident KV-cache bindings.)
+        executionProviders: [{ name: 'webgpu', storageBufferCacheMode: 'lazyRelease' } as any]
+      }
+    })
   })
 
   // ORT's WASM backend completes each step with microtasks only, so a queued 'interrupt'
@@ -154,7 +164,7 @@ function fitToBudget(messages: ChatMessage[]) {
     (tokenizer!.apply_chat_template(msgs, { add_generation_prompt: true, tokenize: true, return_tensor: false }) as unknown as number[]).length
 
   let tokens = count([...system, ...turns])
-  while (tokens > MAX_PROMPT_TOKENS && turns.length > 1) {
+  while (tokens > maxPromptTokens && turns.length > 1) {
     turns = turns.slice(2)
     tokens = count([...system, ...turns])
   }
@@ -184,7 +194,7 @@ async function generate(id: number, messages: ChatMessage[], maxNewTokens: numbe
   })
 
   stopping.reset()
-  await model.generate({
+  const output: any = await model.generate({
     ...inputs,
     max_new_tokens: maxNewTokens,
     do_sample: true,
@@ -195,6 +205,8 @@ async function generate(id: number, messages: ChatMessage[], maxNewTokens: numbe
     streamer,
     stopping_criteria: stopping as any
   })
+  // Free the prompt/output tensors now rather than waiting for GC; every MB matters on phones.
+  for (const t of [output, inputs.input_ids, inputs.attention_mask]) t?.dispose?.()
 
   const end = performance.now()
   const decodeMs = firstTokenAt ? end - firstTokenAt : 0
@@ -245,12 +257,17 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
   }
 })
 
-/** Resolves after pending tasks (e.g. incoming worker messages) have run. */
+/**
+ * Resolves after pending tasks (e.g. incoming worker messages) have run. One shared channel
+ * rather than a new MessageChannel per token: WebKit can be slow to reclaim unclosed ports.
+ */
+const yieldChannel = new MessageChannel()
+const yieldWaiters: (() => void)[] = []
+yieldChannel.port1.onmessage = () => yieldWaiters.shift()?.()
 function yieldToEventLoop() {
   return new Promise<void>((resolve) => {
-    const channel = new MessageChannel()
-    channel.port1.onmessage = () => resolve()
-    channel.port2.postMessage(null)
+    yieldWaiters.push(resolve)
+    yieldChannel.port2.postMessage(null)
   })
 }
 

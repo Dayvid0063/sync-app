@@ -3,7 +3,11 @@ import { CACHE_NAME, type FromWorker, type ToWorker } from './protocol'
 import { fileUrl, variantKey, type ModelSpec, type ModelVariant } from './models'
 import type { DeviceCaps } from './device'
 
-const DEFAULT_MAX_NEW_TOKENS = 512
+/** Phones get shorter replies and history: less memory per reply, within tight browser limits. */
+const LIMITS = {
+  phone: { maxNewTokens: 256, promptBudget: 1024 },
+  other: { maxNewTokens: 512, promptBudget: 1536 }
+}
 /**
  * Upper bound for turning cached files into a running model. Phones that run out of memory
  * here can stall instead of failing (seen on a 4 GB Samsung), so give up and say so.
@@ -27,6 +31,10 @@ export class TransformersEngine implements LLMEngine {
   /** Only construct for devices the model has a variant for (see `variantFor`). */
   constructor(private spec: ModelSpec, private caps: DeviceCaps) {
     this.info = this.infoFor(caps)
+  }
+
+  private get limits() {
+    return this.caps.phone ? LIMITS.phone : LIMITS.other
   }
 
   private variant(caps = this.caps) {
@@ -55,6 +63,13 @@ export class TransformersEngine implements LLMEngine {
     for (const req of await cache.keys()) {
       if (!keep.has(req.url)) await cache.delete(req)
     }
+    // The short-lived wllama build (2026-09-24) stored its ~253 MB model in OPFS; nothing else
+    // in the app uses OPFS, so clear it.
+    try {
+      const root = await navigator.storage.getDirectory() as FileSystemDirectoryHandle & { keys(): AsyncIterable<string> }
+      for await (const name of root.keys()) await root.removeEntry(name, { recursive: true })
+    }
+    catch { /* OPFS unavailable: nothing to clean */ }
   }
 
   load(onProgress?: (p: LoadProgress) => void) {
@@ -70,7 +85,7 @@ export class TransformersEngine implements LLMEngine {
       await this.loadOn(this.caps, onProgress)
     }
     catch (err) {
-      const cpu: DeviceCaps = { device: 'wasm', shaderF16: false, reason: `WebGPU failed: ${(err as Error).message}` }
+      const cpu: DeviceCaps = { device: 'wasm', shaderF16: false, phone: this.caps.phone, reason: `WebGPU failed: ${(err as Error).message}` }
       if (this.caps.device !== 'webgpu' || !variantFor(this.spec, cpu)) throw err
       // WebGPU exists but failed (driver bugs, OOM on low-end GPUs). Retry on CPU.
       console.warn('[afronet] WebGPU load failed, falling back to WASM:', err)
@@ -126,7 +141,8 @@ export class TransformersEngine implements LLMEngine {
           dtype: variant.dtype,
           files: variant.files,
           downloadBytes: variant.downloadBytes,
-          externalData: variant.externalData
+          externalData: variant.externalData,
+          promptBudget: this.limits.promptBudget
         }
       })
     })
@@ -160,7 +176,7 @@ export class TransformersEngine implements LLMEngine {
     if (opts.signal?.aborted) onAbort()
 
     try {
-      this.post({ type: 'generate', id, messages, maxNewTokens: opts.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS })
+      this.post({ type: 'generate', id, messages, maxNewTokens: opts.maxNewTokens ?? this.limits.maxNewTokens })
       while (true) {
         if (queue.length) { yield queue.shift()!; continue }
         if (finished) break

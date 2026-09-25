@@ -1,3 +1,8 @@
+<script setup lang="ts">
+// Start crash detection before anything else runs, so every later event is logged.
+useCrashLog()
+</script>
+
 <template>
   <div class="app">
     <NuxtRouteAnnouncer />

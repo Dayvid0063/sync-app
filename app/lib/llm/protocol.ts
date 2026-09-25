@@ -14,6 +14,8 @@ export interface WorkerLoadConfig {
   files: string[]
   downloadBytes: number
   externalData?: boolean
+  /** Max prompt tokens; older turns are dropped beyond it. */
+  promptBudget: number
 }
 
 export type ToWorker =
